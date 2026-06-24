@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         PTA pintia 学习助手 (MiMo 增强版)
-// @namespace    a jjjjjjjjjjjjun.
-// @version      3.5-mimo
-// @description  自动识别题型，支持判断、单选、函数、编程题。预填 MiMo 模型 API，开箱即用。新增：单题答题、错误题目跳转、复制破解。
-// @author       A Jun (MiMo 增强 by 小龙)
+// @name         PTA pintia 学习助手 (多平台版)
+// @namespace    Likook
+// @version      6.0
+// @description  自动识别题型，支持判断、单选、函数、编程题。支持 DeepSeek / MiMo / GPT 三大平台，一键切换。多策略代码填入，完美绕过复制限制。
+// @author       Likook
 // @match        *://*.pintia.cn/*
 // @grant        GM_addStyle
 // @grant        GM_getValue
@@ -34,6 +34,38 @@
         'span.select-none'
     ];
 
+    // --- 平台预设 ---
+    const PLATFORM_PRESETS = {
+        'deepseek': {
+            name: 'DeepSeek',
+            url: 'https://api.deepseek.com/v1/chat/completions',
+            model: 'deepseek-chat',
+            keyHint: 'sk-... (platform.deepseek.com)',
+            docs: 'platform.deepseek.com'
+        },
+        'mimo': {
+            name: 'MiMo (小米)',
+            url: 'https://api.xiaomimimo.com/v1/chat/completions',
+            model: 'mimo-v2.5-pro',
+            keyHint: 'sk-... (platform.xiaomimimo.com)',
+            docs: 'platform.xiaomimimo.com'
+        },
+        'gpt': {
+            name: 'OpenAI GPT',
+            url: 'https://api.openai.com/v1/chat/completions',
+            model: 'gpt-4o',
+            keyHint: 'sk-... (platform.openai.com)',
+            docs: 'platform.openai.com'
+        },
+        'custom': {
+            name: '自定义',
+            url: '',
+            model: '',
+            keyHint: '自行填写',
+            docs: ''
+        }
+    };
+
     const CONFIG = {
         get autoNext() { return GM_getValue('pta_auto_next', false); },
         set autoNext(v) { GM_setValue('pta_auto_next', v); },
@@ -45,11 +77,13 @@
         set removeComments(v) { GM_setValue('pta_remove_comments', v); },
         get showAnalysis() { return GM_getValue('pta_show_analysis', true); },
         set showAnalysis(v) { GM_setValue('pta_show_analysis', v); },
-        get apiUrl() { return GM_getValue('pta_api_url', 'https://api.xiaomimimo.com/v1/chat/completions'); },
+        get platform() { return GM_getValue('pta_platform', 'deepseek'); },
+        set platform(v) { GM_setValue('pta_platform', v); },
+        get apiUrl() { return GM_getValue('pta_api_url', 'https://api.deepseek.com/v1/chat/completions'); },
         set apiUrl(v) { GM_setValue('pta_api_url', v); },
         get apiKey() { return GM_getValue('pta_api_key', ''); },
         set apiKey(v) { GM_setValue('pta_api_key', v); },
-        get apiModel() { return GM_getValue('pta_api_model', 'mimo-v2.5-pro'); },
+        get apiModel() { return GM_getValue('pta_api_model', 'deepseek-chat'); },
         set apiModel(v) { GM_setValue('pta_api_model', v); }
     };
 
@@ -61,111 +95,200 @@
         'Python': 'Python (python3)'
     };
 
-    // --- 1. 复制破解功能 ---
-    function unlockCopy() {
-        console.log('[PTA Helper] 正在解除复制限制...');
+    // --- 1. 复制破解功能 (参考 pta-paste-bypass 项目) ---
+    let ptaAntiBlockInstalled = false;
 
-        // 方法1: 覆盖 addEventListener，阻止注册 copy/cut/paste 等事件
-        const originalAddEventListener = EventTarget.prototype.addEventListener;
-        const blockedEvents = ['copy', 'cut', 'paste', 'selectstart', 'contextmenu', 'dragstart'];
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
 
-        EventTarget.prototype.addEventListener = function(type, listener, options) {
-            if (blockedEvents.includes(type)) {
-                console.log(`[PTA Helper] 已阻止注册 ${type} 事件监听器`);
+    function ptaNorm(s) {
+        return String(s || '').replace(/\u200b/g, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+    }
+
+    // 清除事件阻止程序
+    function ptaClearBlockers(scope) {
+        try {
+            const root = (scope?.querySelectorAll) ? scope : document;
+            const targets = [document, window];
+            if (document.body) targets.push(document.body);
+            root.querySelectorAll('input,textarea,[contenteditable],.cm-editor,.cm-content').forEach(el => targets.push(el));
+            const props = ['oncopy', 'oncut', 'onpaste', 'oncontextmenu', 'onselectstart', 'onkeydown', 'onbeforeinput'];
+            for (const el of targets) {
+                for (const p of props) { try { el[p] = null; } catch {} }
+                if (el?.style && (el.classList?.contains('cm-editor') || el.classList?.contains('cm-content') || el.isContentEditable)) {
+                    try { el.style.userSelect = 'text'; } catch {}
+                    try { el.style.webkitUserSelect = 'text'; } catch {}
+                }
+            }
+        } catch {}
+    }
+
+    // 安装绕过机制
+    function ptaInstallBypass() {
+        if (ptaAntiBlockInstalled) return;
+        ptaAntiBlockInstalled = true;
+
+        const isEd = t => {
+            if (!t || !(t instanceof Element)) return false;
+            if (t.isContentEditable) return true;
+            const tag = t.tagName.toLowerCase();
+            if (tag === 'textarea') return true;
+            if (tag === 'input') {
+                const tp = (t.getAttribute('type') || 'text').toLowerCase();
+                return !['button', 'submit', 'checkbox', 'radio', 'file', 'image', 'reset', 'color'].includes(tp);
+            }
+            return Boolean(t.closest('textarea,input,[contenteditable=true],.cm-editor,.cm-content'));
+        };
+
+        const g = e => {
+            if (!isEd(e.target)) return;
+            e.stopImmediatePropagation();
+        };
+
+        const kg = e => {
+            if (!isEd(e.target)) return;
+            if ((e.ctrlKey || e.metaKey) && ['v', 'c', 'x', 'a'].includes(String(e.key).toLowerCase())) {
+                e.stopImmediatePropagation();
+            }
+        };
+
+        ['copy', 'cut', 'paste', 'beforeinput', 'selectstart', 'contextmenu'].forEach(t => window.addEventListener(t, g, true));
+        window.addEventListener('keydown', kg, true);
+
+        // 手动粘贴拦截 - 支持用户 Ctrl+V 粘贴代码
+        document.addEventListener('paste', function(e) {
+            const contentDiv = document.querySelector('.cm-content[contenteditable=true]');
+            if (!contentDiv) return;
+            if (!contentDiv.contains(document.activeElement) && contentDiv !== document.activeElement) return;
+
+            let pastedText = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
+            if (!pastedText) return;
+
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            pastedText = pastedText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+            // 尝试用 CM API 填入
+            if (ptaFillCMApi(contentDiv, pastedText)) {
+                console.log('[PTA] 手动粘贴成功 (CM API)');
                 return;
             }
-            return originalAddEventListener.call(this, type, listener, options);
-        };
 
-        // 方法2: 在捕获阶段拦截并阻止事件传播
-        blockedEvents.forEach(eventType => {
-            document.addEventListener(eventType, function(e) {
-                e.stopImmediatePropagation();
-                e.stopPropagation();
-                // 对于某些事件，还需要阻止默认行为
-                if (eventType === 'selectstart') {
-                    // 不阻止默认行为，允许选择
+            // 回退：逐块插入
+            const chunkSize = 200;
+            (async function() {
+                contentDiv.focus();
+                document.execCommand('selectAll', false, null);
+                document.execCommand('delete', false, null);
+                await sleep(50);
+                for (let i = 0; i < pastedText.length; i += chunkSize) {
+                    const chunk = pastedText.substring(i, i + chunkSize);
+                    document.execCommand('insertText', false, chunk);
+                    await sleep(10);
                 }
-            }, true); // 使用捕获阶段
-        });
+                console.log('[PTA] 手动粘贴完成 (execCommand)');
+            })();
+        }, true);
 
-        // 方法3: 移除元素上的 onXXX 属性
-        function removeInlineHandlers() {
-            const elements = [document, document.body, ...document.querySelectorAll('*')];
-            elements.forEach(el => {
-                blockedEvents.forEach(eventType => {
-                    if (el[`on${eventType}`]) {
-                        el[`on${eventType}`] = null;
-                    }
+        ptaClearBlockers(document);
+        setInterval(() => ptaClearBlockers(document), 1500);
+
+        console.log('[PTA Helper] 绕过机制已安装');
+    }
+
+    // 查找 CodeMirror 实例
+    function ptaFindCM(editor) {
+        let node = editor;
+        while (node) {
+            // CM5
+            if (node.CodeMirror && typeof node.CodeMirror.setValue === 'function') {
+                console.log('[PTA] 找到 CodeMirror 5 实例');
+                return { type: 'cm5', instance: node.CodeMirror };
+            }
+            // CM6 - 多种可能的路径
+            const cv = node.cmView;
+            if (cv?.view?.state?.doc && typeof cv.view.dispatch === 'function') {
+                console.log('[PTA] 找到 CodeMirror 6 实例 (cmView.view)');
+                return { type: 'cm6', instance: cv.view };
+            }
+            if (cv?.rootView?.view?.state?.doc && typeof cv.rootView.view.dispatch === 'function') {
+                console.log('[PTA] 找到 CodeMirror 6 实例 (rootView.view)');
+                return { type: 'cm6', instance: cv.rootView.view };
+            }
+            // 直接从 .cm-editor 元素查找
+            if (node.classList?.contains('cm-editor')) {
+                if (node.CodeMirror) {
+                    console.log('[PTA] 找到 CodeMirror 5 实例 (.cm-editor)');
+                    return { type: 'cm5', instance: node.CodeMirror };
+                }
+                if (node.cmView?.view) {
+                    console.log('[PTA] 找到 CodeMirror 6 实例 (.cm-editor.cmView.view)');
+                    return { type: 'cm6', instance: node.cmView.view };
+                }
+            }
+            if (node.view?.state?.doc && typeof node.view.dispatch === 'function') {
+                console.log('[PTA] 找到 CodeMirror 6 实例 (node.view)');
+                return { type: 'cm6', instance: node.view };
+            }
+            // 尝试从 __vue_app__ 或其他 React 属性获取
+            const vueCm = node._cmView || node.__cm;
+            if (vueCm?.view?.state?.doc && typeof vueCm.view.dispatch === 'function') {
+                console.log('[PTA] 找到 CodeMirror 6 实例 (私有属性)');
+                return { type: 'cm6', instance: vueCm.view };
+            }
+            node = node.parentElement;
+        }
+        console.log('[PTA] 未找到 CodeMirror 实例，将使用 DOM 方式填入');
+        return null;
+    }
+
+    // CodeMirror API 填入
+    function ptaFillCMApi(editor, code) {
+        const f = ptaFindCM(editor);
+        if (!f) return false;
+        try {
+            if (f.type === 'cm6') {
+                const docLength = f.instance.state.doc.length;
+                f.instance.dispatch({
+                    changes: { from: 0, to: docLength, insert: code },
+                    selection: { anchor: code.length }
                 });
-            });
+                if (typeof f.instance.focus === 'function') f.instance.focus();
+                console.log(`[PTA] CM6 填入成功，共 ${code.length} 字符`);
+                return true;
+            }
+            if (f.type === 'cm5') {
+                f.instance.setValue(code);
+                if (typeof f.instance.focus === 'function') f.instance.focus();
+                console.log(`[PTA] CM5 填入成功，共 ${code.length} 字符`);
+                return true;
+            }
+        } catch (e) {
+            console.error('[PTA] CM API 填入失败:', e);
         }
-        removeInlineHandlers();
-
-        // 方法4: 添加 CSS 强制允许选择
-        const style = document.createElement('style');
-        style.id = 'pta-helper-unlock-copy';
-        style.textContent = `
-            *, *::before, *::after {
-                -webkit-user-select: text !important;
-                -moz-user-select: text !important;
-                -ms-user-select: text !important;
-                user-select: text !important;
-                -webkit-touch-callout: default !important;
-                pointer-events: auto !important;
-            }
-            input, textarea, [contenteditable] {
-                -webkit-user-modify: read-write !important;
-                user-modify: read-write !important;
-            }
-            /* 移除可能的事件阻止层 */
-            [class*="lock"], [class*="prevent"], [class*="disable"] {
-                pointer-events: auto !important;
-            }
-        `;
-        if (!document.getElementById('pta-helper-unlock-copy')) {
-            document.head.appendChild(style);
-        }
-
-        // 方法5: 定期检查并移除新添加的限制
-        setInterval(() => {
-            removeInlineHandlers();
-
-            // 移除 data 属性中的事件处理
-            document.querySelectorAll('[data-copy], [data-cut], [data-paste]').forEach(el => {
-                el.removeAttribute('data-copy');
-                el.removeAttribute('data-cut');
-                el.removeAttribute('data-paste');
-            });
-        }, 1000);
-
-        // 方法6: 覆盖 document.execCommand 以确保复制可用
-        const originalExecCommand = document.execCommand;
-        document.execCommand = function(command) {
-            if (command === 'copy' || command === 'cut' || command === 'paste') {
-                console.log(`[PTA Helper] 允许执行 ${command} 命令`);
-            }
-            return originalExecCommand.apply(this, arguments);
-        };
-
-        console.log('[PTA Helper] 复制限制已解除');
+        return false;
     }
 
-    // 立即执行
-    unlockCopy();
+    // 事件触发
+    function ptaTrigger(editor, text) {
+        try { editor.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true })); } catch {}
+        try { editor.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: text })); } catch {}
+        try { editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text })); } catch {}
+        editor.dispatchEvent(new Event('input', { bubbles: true }));
+        editor.dispatchEvent(new Event('change', { bubbles: true }));
+        try { editor.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true })); } catch {}
+    }
 
-    // 页面加载完成后再执行一次
+    // 立即安装绕过机制
+    ptaInstallBypass();
+
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', unlockCopy);
-    } else {
-        // 已经加载完成，延迟再执行一次确保生效
-        setTimeout(unlockCopy, 500);
+        document.addEventListener('DOMContentLoaded', ptaInstallBypass);
     }
-
-    // 页面完全加载后再次执行
     window.addEventListener('load', () => {
-        unlockCopy();
-        console.log('[PTA Helper] 页面加载完成，再次解除复制限制');
+        ptaInstallBypass();
+        console.log('[PTA Helper] 页面加载完成，绕过机制已就绪');
     });
 
     // --- 2. 样式定义 ---
@@ -347,6 +470,54 @@
             padding: 10px;
             border-radius: 6px;
             border-left: 3px solid #e6a23c;
+        }
+        /* 平台选择按钮 */
+        .platform-selector {
+            display: flex;
+            gap: 6px;
+            margin-bottom: 15px;
+            flex-wrap: wrap;
+        }
+        .platform-btn {
+            flex: 1;
+            min-width: 70px;
+            padding: 8px 6px;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            text-align: center;
+            transition: all 0.2s;
+            background: white;
+            color: #666;
+        }
+        .platform-btn:hover {
+            border-color: #667eea;
+            background: #f0f2ff;
+        }
+        .platform-btn.active {
+            border-color: #667eea;
+            background: #667eea;
+            color: white;
+        }
+        .platform-btn.deepseek.active { background: #4D6BFE; border-color: #4D6BFE; }
+        .platform-btn.mimo.active { background: #667eea; border-color: #667eea; }
+        .platform-btn.gpt.active { background: #10a37f; border-color: #10a37f; }
+        .platform-btn.custom.active { background: #718096; border-color: #718096; }
+        .platform-info {
+            font-size: 11px;
+            color: #999;
+            margin-top: -8px;
+            margin-bottom: 12px;
+            text-align: right;
+        }
+        .platform-info a {
+            color: #667eea;
+            text-decoration: none;
+        }
+        .platform-info a:hover {
+            text-decoration: underline;
         }
         #pta-tab-content {
             flex: 1;
@@ -563,29 +734,30 @@
                 </div>
             </div>
             <div id="api-tab" class="tab-pane">
+                <div style="font-size: 11px; color: #999; margin-bottom: 8px;">选择平台即可自动填充配置：</div>
+                <div class="platform-selector" id="platform-selector">
+                    <div class="platform-btn deepseek" data-platform="deepseek">DeepSeek</div>
+                    <div class="platform-btn mimo" data-platform="mimo">MiMo</div>
+                    <div class="platform-btn gpt" data-platform="gpt">GPT</div>
+                    <div class="platform-btn custom" data-platform="custom">自定义</div>
+                </div>
+                <div class="platform-info" id="platform-info"></div>
                 <div class="api-input-group">
                     <label>API URL:</label>
-                    <input type="text" id="api-url-input" value="${CONFIG.apiUrl}" placeholder="https://api.xiaomimimo.com/v1/chat/completions">
+                    <input type="text" id="api-url-input" value="${CONFIG.apiUrl}">
                 </div>
                 <div class="api-input-group">
                     <label>API Key:</label>
-                    <input type="password" id="api-key-input" value="${CONFIG.apiKey}" placeholder="sk-... (MiMo 平台申请)">
+                    <input type="password" id="api-key-input" value="${CONFIG.apiKey}">
                 </div>
                 <div class="api-input-group">
                     <label>模型 (Model):</label>
-                    <input type="text" id="api-model-input" value="${CONFIG.apiModel}" placeholder="mimo-v2.5-pro 或 mimo-v2-flash">
+                    <input type="text" id="api-model-input" value="${CONFIG.apiModel}">
                 </div>
                 <div class="api-tips">
-                    请填写支持 OpenAI 格式的 API 接口。<br>
-                    如果您使用中转 API，请确保填写的 URL 包含完整路径（通常以 /v1/chat/completions 结尾）。
-                </div>
-                <div style="margin-top: 15px; padding: 12px; background: #f0f9eb; border-radius: 8px; font-size: 12px; border: 1px solid #e1f3d8; color: #67c23a;">
-                    <strong>当前默认已预填小米 MiMo：</strong>
-                    <div style="margin-top: 5px; font-family: monospace; background: #fff; padding: 8px; border-radius: 4px; border: 1px solid #e1f3d8; line-height: 1.5;">
-                        API URL: https://api.xiaomimimo.com/v1/chat/completions<br>
-                        模型 (Model): mimo-v2.5-pro（强）或 mimo-v2-flash（快）
-                    </div>
-                    <span style="font-size: 11px; color: #999; display: block; margin-top: 5px;">* 填好 API Key 即可使用。Key 申请: platform.xiaomimimo.com</span>
+                    支持任何兼容 OpenAI Chat Completions 格式的 API。<br>
+                    URL 需包含完整路径（通常以 /v1/chat/completions 结尾）。<br>
+                    选择上方平台可一键填充配置，选择「自定义」可手动填写。
                 </div>
             </div>
         </div>
@@ -831,9 +1003,80 @@
     document.getElementById('remove-comments-input').onchange = (e) => CONFIG.removeComments = e.target.checked;
     document.getElementById('func-lang-select').onchange = (e) => CONFIG.funcLang = e.target.value;
     document.getElementById('prog-lang-select').onchange = (e) => CONFIG.progLang = e.target.value;
-    document.getElementById('api-url-input').onchange = (e) => CONFIG.apiUrl = e.target.value;
-    document.getElementById('api-key-input').onchange = (e) => CONFIG.apiKey = e.target.value;
-    document.getElementById('api-model-input').onchange = (e) => CONFIG.apiModel = e.target.value;
+
+    // API 手动输入保存
+    const apiUrlInput = document.getElementById('api-url-input');
+    const apiKeyInput = document.getElementById('api-key-input');
+    const apiModelInput = document.getElementById('api-model-input');
+
+    apiUrlInput.onchange = (e) => { CONFIG.apiUrl = e.target.value; updatePlatformInfo(); };
+    apiKeyInput.onchange = (e) => CONFIG.apiKey = e.target.value;
+    apiModelInput.onchange = (e) => { CONFIG.apiModel = e.target.value; updatePlatformInfo(); };
+
+    // 平台选择
+    const platformInfoEl = document.getElementById('platform-info');
+
+    function updatePlatformInfo() {
+        const platform = CONFIG.platform;
+        if (platform === 'custom') {
+            platformInfoEl.innerHTML = '<span style="color: #999;">自定义模式</span>';
+        } else {
+            const preset = PLATFORM_PRESETS[platform];
+            if (preset) {
+                platformInfoEl.innerHTML = `<span>Key 申请: <a href="https://${preset.docs}" target="_blank">${preset.docs}</a></span>`;
+            }
+        }
+    }
+
+    function applyPlatformPreset(platform) {
+        const preset = PLATFORM_PRESETS[platform];
+        if (!preset) return;
+
+        CONFIG.platform = platform;
+
+        if (platform === 'custom') {
+            // 自定义模式：保持当前值不变
+            platformInfoEl.innerHTML = '<span style="color: #999;">自定义模式 — 请手动填写下方配置</span>';
+        } else {
+            // 更新配置并保存
+            CONFIG.apiUrl = preset.url;
+            CONFIG.apiModel = preset.model;
+
+            // 更新输入框
+            apiUrlInput.value = preset.url;
+            apiModelInput.value = preset.model;
+            apiKeyInput.placeholder = preset.keyHint;
+
+            updatePlatformInfo();
+        }
+
+        // 更新按钮状态
+        document.querySelectorAll('.platform-btn').forEach(b => {
+            b.classList.remove('active');
+            if (b.dataset.platform === platform) {
+                b.classList.add('active');
+            }
+        });
+    }
+
+    // 平台按钮点击事件
+    document.querySelectorAll('.platform-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            applyPlatformPreset(btn.dataset.platform);
+        });
+    });
+
+    // 初始化平台状态
+    (function initPlatform() {
+        const savedPlatform = CONFIG.platform;
+        // 高亮当前平台按钮
+        document.querySelectorAll('.platform-btn').forEach(b => {
+            if (b.dataset.platform === savedPlatform) {
+                b.classList.add('active');
+            }
+        });
+        updatePlatformInfo();
+    })();
 
     document.getElementById('clear-btn').onclick = () => { logContainer.innerHTML = ''; };
 
@@ -1118,60 +1361,132 @@
     }
 
     async function fillCodeEditor(code) {
-        unlockCopy();
+        ptaInstallBypass();
 
         const container = document.querySelector('[data-e2e="code-editor-input"]');
-        let editors = container ?
-            Array.from(container.querySelectorAll('.cm-content[contenteditable="true"]')) :
-            Array.from(document.querySelectorAll('.cm-content[contenteditable="true"]'));
+        let editors = container
+            ? Array.from(container.querySelectorAll('.cm-content[contenteditable=true]'))
+            : Array.from(document.querySelectorAll('.cm-content[contenteditable=true]'));
 
-        if (editors.length === 0) {
-            const anyEditor = document.querySelector('.cm-content');
-            if (anyEditor) editors = [anyEditor];
+        if (!editors.length) {
+            const any = document.querySelector('.cm-content');
+            if (any) editors = [any];
         }
 
-        if (editors.length === 0) return false;
+        if (!editors.length) {
+            addInfoLog('[填入] 找不到代码编辑器');
+            return false;
+        }
 
         const editor = editors[editors.length - 1];
+        const cmRoot = editor.closest('.cm-editor');
+        if (cmRoot) ptaClearBlockers(cmRoot);
 
         editor.focus();
+        const finalCode = String(code).replace(/\r\n/g, '\n');
 
         try {
+            const isFilledEnough = () => {
+                const c = ptaNorm(editor.innerText || editor.textContent);
+                // 至少要有 80% 的内容
+                return c.length > 0 && c.length >= finalCode.length * 0.8;
+            };
+
+            addInfoLog(`[填入] 正在填入代码 (${finalCode.length} 字符)...`);
+
+            // 策略0: CodeMirror API (最可靠)
+            if (ptaFillCMApi(editor, finalCode)) {
+                await sleep(100);
+                if (isFilledEnough()) {
+                    addInfoLog('[填入] 成功 (CodeMirror API)');
+                    return true;
+                }
+                addInfoLog(`[填入] CM API 后不完整，编辑器只有 ${ptaNorm(editor.innerText).length} 字符，回退...`);
+            }
+
+            // 策略1: execCommand 一次性插入
             document.execCommand('selectAll', false, null);
             document.execCommand('delete', false, null);
-            await new Promise(r => setTimeout(r, 100));
-
-            const dataTransfer = new DataTransfer();
-            dataTransfer.setData('text/plain', code);
-            const pasteEvent = new ClipboardEvent('paste', {
-                clipboardData: dataTransfer,
-                bubbles: true,
-                cancelable: true
-            });
-            editor.dispatchEvent(pasteEvent);
-
-            await new Promise(r => setTimeout(r, 200));
-            if (editor.innerText.trim().length < 5) {
-                document.execCommand('insertText', false, code);
+            await sleep(100);
+            // execCommand insertText 对大文本可能有限制，分块插入
+            const chunkSize = 500;
+            for (let i = 0; i < finalCode.length; i += chunkSize) {
+                const chunk = finalCode.substring(i, i + chunkSize);
+                document.execCommand('insertText', false, chunk);
+                await sleep(15);
             }
-
-            if (editor.innerText.trim().length < 5) {
-                editor.innerText = code;
-                editor.dispatchEvent(new Event('input', { bubbles: true }));
+            await sleep(150);
+            if (isFilledEnough()) {
+                addInfoLog('[填入] 成功 (execCommand 分块)');
+                return true;
             }
+            addInfoLog(`[填入] execCommand 后不完整(${ptaNorm(editor.innerText).length})，回退...`);
 
-            if (editor.innerText.trim().length < 5) {
-                const chars = code.split('');
-                for (const char of chars) {
-                    editor.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
-                    document.execCommand('insertText', false, char);
-                    editor.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
+            // 策略2: 逐行插入 (更小的块)
+            document.execCommand('selectAll', false, null);
+            document.execCommand('delete', false, null);
+            await sleep(60);
+            const lines = finalCode.split('\n');
+            let lineSuccess = 0;
+            for (let i = 0; i < lines.length; i++) {
+                if (lines[i].length > 0) {
+                    document.execCommand('insertText', false, lines[i]);
+                }
+                if (i < lines.length - 1) {
+                    document.execCommand('insertLineBreak', false, null);
+                }
+                await sleep(10);
+                lineSuccess++;
+            }
+            await sleep(150);
+            if (isFilledEnough()) {
+                addInfoLog(`[填入] 成功 (逐行插入, ${lineSuccess}/${lines.length} 行)`);
+                return true;
+            }
+            addInfoLog(`[填入] 逐行后不完整(${ptaNorm(editor.innerText).length})，回退...`);
+
+            // 策略3: 逐字符模拟输入（终极方案）
+            document.execCommand('selectAll', false, null);
+            document.execCommand('delete', false, null);
+            await sleep(60);
+            addInfoLog(`[填入] 使用逐字符输入 (${Math.ceil(finalCode.length / 3)} 批)...`);
+            const tinyChunk = 3; // 每次3个字符
+            for (let i = 0; i < finalCode.length; i += tinyChunk) {
+                const bit = finalCode.substring(i, i + tinyChunk);
+                // 使用 dispatchEvent 模拟键盘输入
+                const inputEvent = new InputEvent('input', {
+                    bubbles: true,
+                    inputType: 'insertText',
+                    data: bit,
+                    dataTransfer: null
+                });
+                editor.dispatchEvent(inputEvent);
+                // 也在 selection 处插入
+                document.execCommand('insertText', false, bit);
+                await sleep(5);
+            }
+            await sleep(200);
+
+            // 策略4: 再试 CM API（双重保险）
+            ptaFillCMApi(editor, finalCode);
+            await sleep(100);
+
+            const finalLen = ptaNorm(editor.innerText).length;
+            if (finalLen > 0) {
+                if (finalLen >= finalCode.length * 0.8) {
+                    addInfoLog(`[填入] 成功 (最终, ${finalLen}/${finalCode.length} 字符)`);
+                    return true;
+                } else {
+                    addInfoLog(`[填入] 部分成功 (${finalLen}/${finalCode.length} 字符)，可能需手动补全`);
+                    return true;
                 }
             }
 
-            return true;
+            addInfoLog('[填入] 所有策略均失败');
+            return false;
         } catch (e) {
-            console.error("代码填充失败:", e);
+            console.error('[PTA Helper] 代码填充失败:', e);
+            addInfoLog(`[填入] 异常: ${e.message}`);
             return false;
         }
     }
@@ -2165,6 +2480,19 @@
         if (problemBtns.length === 0) { addInfoLog("未找到题目按钮"); return; }
 
         const targetLang = type === 'FUNC' ? CONFIG.funcLang : CONFIG.progLang;
+
+        // 单题模式
+        if (targetQuestionNum) {
+            const idx = targetQuestionNum - 1;
+            if (idx < 0 || idx >= problemBtns.length) {
+                addInfoLog(`题号 ${targetQuestionNum} 超出范围（共 ${problemBtns.length} 题）`);
+                return;
+            }
+            addModeInfoLog(`[${type === 'FUNC' ? '函数题' : '编程题'}] 第 ${targetQuestionNum} 题`);
+            await solveSingleCodeProblem(problemBtns[idx], idx, type, targetLang);
+            return;
+        }
+
         addModeInfoLog(`[${type === 'FUNC' ? '函数题' : '编程题'}] 共有 ${problemBtns.length} 题，预设语言: ${targetLang}`);
 
         for (let i = 0; i < problemBtns.length; i++) {
@@ -2287,6 +2615,122 @@
         }
     }
 
+    // 单题编程题
+    async function solveSingleCodeProblem(btn, index, type, targetLang) {
+        if (btn.querySelector('.PROBLEM_ACCEPTED_iri62')) {
+            addInfoLog(`第 ${index + 1} 题已通过，跳过`);
+            return;
+        }
+
+        addInfoLog(`正在解决第 ${index + 1} 题...`);
+        btn.click();
+        await new Promise(r => setTimeout(r, 2500));
+
+        if (!isRunning) return;
+
+        await switchLanguage(targetLang);
+
+        let editorExists = false;
+        for (let j = 0; j < 10; j++) {
+            if (document.querySelector('.cm-content')) {
+                editorExists = true;
+                break;
+            }
+            addInfoLog(`等待编辑器加载中 (${j + 1}/10)...`);
+            await new Promise(r => setTimeout(r, 1000));
+        }
+
+        if (!editorExists) {
+            addInfoLog(`[跳过] 无法加载编辑器，跳过此题。`, false);
+            return;
+        }
+
+        const contentArea = document.querySelector('.rendered-markdown') ||
+                            document.querySelector('.generalProblemBody_WIhdN') ||
+                            document.querySelector('.problem-body') ||
+                            document.querySelector('.problemBody_S_NqD');
+
+        const infoList = document.querySelector('.problemInfo_HVczC');
+        const infoText = infoList ? infoList.innerText.replace(/\n+/g, ' ').trim() : '';
+
+        const title = document.querySelector('.text-darkest.font-bold.text-lg')?.innerText ||
+                      document.querySelector('.problem-title')?.innerText ||
+                      `第 ${index + 1} 题`;
+        const logItem = addLog(title);
+
+        try {
+            if (!isRunning) return;
+            addInfoLog(`正在请求 AI 生成代码 (${targetLang})...`);
+
+            const mainContent = getCleanText(contentArea || document.body);
+            const fullPrompt = `【题目标题】：${title}\n【限制信息】：${infoText}\n【题目正文】：\n${mainContent}`;
+
+            const result = await askAI(fullPrompt, type, targetLang);
+
+            if (!isRunning) return;
+
+            if (currentMode === 'check') {
+                addInfoLog(`[编程题] 检查模式暂不支持编程题自动检查，请手动验证代码。`);
+                updateLogSolve(logItem, '请手动检查代码', result.analysis, true);
+            } else {
+                // 自动答题模式
+                addInfoLog(`AI 生成完毕，正在填入编辑器...`);
+
+                let codeToFill = result.full;
+                if (CONFIG.removeComments) {
+                    addInfoLog(`[优化] 正在本地清除代码注释以符合提交要求...`);
+                    codeToFill = removeComments(result.full, targetLang);
+                }
+
+                const filled = await fillCodeEditor(codeToFill);
+
+                if (filled) {
+                    await new Promise(r => setTimeout(r, 800));
+                    if (!isRunning) return;
+
+                    const submitBtn = Array.from(document.querySelectorAll('button')).find(b =>
+                        b.innerText.includes('提交本题作答') || b.querySelector('.pc-text-raw')?.innerText === '提交本题作答'
+                    );
+
+                    if (submitBtn) {
+                        addInfoLog(`[操作] 点击提交按钮...`);
+                        submitBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        submitBtn.click();
+
+                        addInfoLog(`[等待] 等待提交结果返回...`);
+                        let foundResult = false;
+                        for (let attempt = 0; attempt < 15; attempt++) {
+                            if (!isRunning) break;
+                            const closeBtn = document.querySelector('button[data-e2e="modal-close-btn"]');
+                            if (closeBtn) {
+                                addInfoLog(`[成功] 检测到提交结果窗口，准备关闭...`);
+                                closeBtn.click();
+                                foundResult = true;
+                                break;
+                            }
+                            await new Promise(r => setTimeout(r, 1000));
+                        }
+
+                        if (!foundResult && isRunning) {
+                            addInfoLog(`[警告] 提交后未检测到结果反馈，请检查。`, false);
+                        }
+
+                        updateLogSolve(logItem, `已提交 (${targetLang})`, result.analysis, true);
+                    } else {
+                        addInfoLog(`[错误] 未能定位到提交按钮！`, false);
+                        updateLogSolve(logItem, "未找到提交按钮", '', false);
+                    }
+                } else {
+                    addInfoLog(`[错误] 无法填入代码。`, false);
+                    updateLogSolve(logItem, "编辑器定位失败", '', false);
+                }
+            }
+        } catch (err) {
+            addInfoLog(`[异常] ${err}`);
+            updateLogSolve(logItem, `错误: ${err}`, '', false);
+        }
+    }
+
     // --- 15. 主逻辑入口 ---
     async function solveCurrentPage() {
         if (isRunning) return;
@@ -2301,7 +2745,7 @@
         startBtn.style.display = 'none';
         stopBtn.style.display = 'inline-block';
 
-        unlockCopy();
+        ptaInstallBypass();
 
         if (currentMode === 'solve') {
             if (targetQuestionNum) {
