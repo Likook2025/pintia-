@@ -19,7 +19,7 @@
 
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/) 浏览器扩展
 2. 点击 Tampermonkey 图标 → **创建新脚本**
-3. 将 [`pintia-helper-mimo.user.js`](./pintia-helper-mimo.user.js) 的内容粘贴进去，保存
+3. 将 [`pintia-helper.js`](./pintia-helper.js) 的内容粘贴进去，保存
 4. 访问 [pintia.cn](https://pintia.cn) 的考试页面，右下角出现小图标即安装成功
 
 ## 🚀 使用方法
